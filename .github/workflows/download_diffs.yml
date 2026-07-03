@@ -48,7 +48,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests
+        run: pip install requests huggingface_hub
 
       - name: Download and upload batch
         env:

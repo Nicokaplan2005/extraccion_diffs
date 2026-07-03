@@ -15,6 +15,7 @@ import os, sys, time, json, requests
 from pathlib import Path
 from queue import Queue
 from threading import Thread, Lock
+from huggingface_hub import HfApi, CommitOperationAdd
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -77,17 +78,22 @@ def download_diff(owner_repo, pr_num, token_idx):
             time.sleep(3 * (attempt + 1))
     return None
 
+_hf_api = HfApi(token=HF_TOKEN)
+
 def hf_upload_files(files_dict):
-    url = f'{HF_API}/api/datasets/{HF_DATASET}/upload/main'
-    headers = {'Authorization': f'Bearer {HF_TOKEN}'}
-    multipart = [('file', (path, content, 'text/plain')) for path, content in files_dict.items()]
+    operations = [
+        CommitOperationAdd(path_in_repo=path, path_or_fileobj=content)
+        for path, content in files_dict.items()
+    ]
     for attempt in range(MAX_RETRIES):
         try:
-            r = requests.post(url, headers=headers, files=multipart, timeout=300)
-            if r.status_code in (200, 201):
-                return True
-            print(f'  HF {r.status_code}: {r.text[:150]}', flush=True)
-            time.sleep(10)
+            _hf_api.create_commit(
+                repo_id=HF_DATASET,
+                repo_type='dataset',
+                operations=operations,
+                commit_message=f'upload {len(operations)} diffs',
+            )
+            return True
         except Exception as e:
             print(f'  HF error ({attempt+1}): {e}', flush=True)
             time.sleep(10 * (attempt + 1))
