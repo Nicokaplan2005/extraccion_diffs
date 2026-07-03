@@ -13,6 +13,8 @@ Variables de entorno:
 
 import os, sys, time, json, requests
 from pathlib import Path
+from queue import Queue
+from threading import Thread, Lock
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -37,16 +39,21 @@ OUT_DIR      = Path('/tmp/diffs')
 LOG_FILE     = Path('/tmp/download_log.jsonl')
 SUMMARY_FILE = Path('/tmp/job_summary.txt')
 
-SLEEP_BETWEEN = 0.25
-MAX_RETRIES   = 5
-BATCH_UPLOAD  = 200
+MAX_RETRIES  = 3
+BATCH_UPLOAD = 300   # subir a HF cada N archivos
+N_THREADS    = len(GH_TOKENS)  # un thread por token
+
+# ── Contadores compartidos ────────────────────────────────────────────────────
+
+lock         = Lock()
+results      = {'downloaded': 0, 'skipped': 0, 'failed': 0}
+pending_hf   = {}   # {hf_path: content_bytes} — se drena cada BATCH_UPLOAD
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def gh_headers(token_idx):
-    tok = GH_TOKENS[token_idx % len(GH_TOKENS)]
     return {
-        'Authorization': f'Bearer {tok}',
+        'Authorization': f'Bearer {GH_TOKENS[token_idx % len(GH_TOKENS)]}',
         'Accept': 'application/vnd.github.diff',
         'User-Agent': 'pr-diff-downloader/1.0',
     }
@@ -59,48 +66,18 @@ def download_diff(owner_repo, pr_num, token_idx):
             if r.status_code == 200:
                 return r.text
             if r.status_code in (404, 406, 410):
-                # 404: PR no existe, 406: diff no disponible, 410: eliminada
                 return None
             if r.status_code in (429, 403):
                 wait = int(r.headers.get('Retry-After', 60))
-                print(f'  rate limit, sleep {wait}s', flush=True)
+                print(f'  [{token_idx}] rate limit {wait}s', flush=True)
                 time.sleep(wait)
                 continue
-            print(f'  HTTP {r.status_code} para {owner_repo}#{pr_num}', flush=True)
-            time.sleep(5)
+            time.sleep(3)
         except Exception as e:
-            print(f'  error ({attempt+1}/{MAX_RETRIES}): {e}', flush=True)
-            time.sleep(5 * (attempt + 1))
+            time.sleep(3 * (attempt + 1))
     return None
 
-def hf_upload_batch(files_dict):
-    """Sube archivos via HuggingFace Hub commit API."""
-    url = f'{HF_API}/api/datasets/{HF_DATASET}/commit/main'
-    headers = {'Authorization': f'Bearer {HF_TOKEN}'}
-
-    # Primero hacer pre-upload de los blobs
-    operations = []
-    for hf_path, content_bytes in files_dict.items():
-        # Upload blob
-        blob_url = f'{HF_API}/api/datasets/{HF_DATASET}/upload/main'
-        for attempt in range(MAX_RETRIES):
-            try:
-                r = requests.post(blob_url, headers=headers,
-                                  files=[('file', (hf_path, content_bytes, 'text/plain'))],
-                                  timeout=120)
-                if r.status_code in (200, 201):
-                    break
-                print(f'  blob upload {r.status_code}: {r.text[:100]}', flush=True)
-                time.sleep(5)
-            except Exception as e:
-                print(f'  blob error ({attempt+1}): {e}', flush=True)
-                time.sleep(10)
-        else:
-            return False
-    return True
-
 def hf_upload_files(files_dict):
-    """Sube lote de archivos usando la API de upload de HuggingFace."""
     url = f'{HF_API}/api/datasets/{HF_DATASET}/upload/main'
     headers = {'Authorization': f'Bearer {HF_TOKEN}'}
     multipart = [('file', (path, content, 'text/plain')) for path, content in files_dict.items()]
@@ -109,27 +86,61 @@ def hf_upload_files(files_dict):
             r = requests.post(url, headers=headers, files=multipart, timeout=300)
             if r.status_code in (200, 201):
                 return True
-            print(f'  HF upload HTTP {r.status_code}: {r.text[:200]}', flush=True)
+            print(f'  HF {r.status_code}: {r.text[:150]}', flush=True)
             time.sleep(10)
         except Exception as e:
-            print(f'  HF upload error ({attempt+1}): {e}', flush=True)
+            print(f'  HF error ({attempt+1}): {e}', flush=True)
             time.sleep(10 * (attempt + 1))
     return False
 
-def write_summary(job_idx, downloaded, skipped, failed, total_prs, repos):
-    lines = [
-        f'## Job {job_idx} — resumen\n',
-        f'| | |',
-        f'|---|---|',
-        f'| PRs asignados | {total_prs} |',
-        f'| Descargados y subidos a HF | {downloaded} |',
-        f'| No disponibles (404/406) | {skipped} |',
-        f'| Fallos de upload | {failed} |',
-        f'| Repos | {", ".join(repos)} |',
-    ]
-    if MAX_PRS:
-        lines.insert(1, f'> **TEST MODE**: limitado a {MAX_PRS} PRs por repo\n')
-    SUMMARY_FILE.write_text('\n'.join(lines), encoding='utf-8')
+def flush_pending():
+    """Toma los archivos pendientes y los sube a HF. Llamar con lock adquirido."""
+    global pending_hf
+    if not pending_hf:
+        return
+    batch = dict(pending_hf)
+    pending_hf = {}
+    # Soltar lock mientras se hace el upload (puede tardar)
+    lock.release()
+    ok = hf_upload_files(batch)
+    lock.acquire()
+    if ok:
+        print(f'  subidos {len(batch)} archivos a HF', flush=True)
+    else:
+        results['failed'] += len(batch)
+        print(f'  FALLO upload {len(batch)} archivos', flush=True)
+
+# ── Worker ────────────────────────────────────────────────────────────────────
+
+def worker(token_idx, queue):
+    global pending_hf
+    while True:
+        try:
+            repo, pr_num = queue.get_nowait()
+        except Exception:
+            break
+
+        hf_path   = f'pr_diffs/{repo}/{pr_num}.diff'
+        diff_text = download_diff(repo, pr_num, token_idx)
+
+        with lock:
+            if diff_text is None:
+                results['skipped'] += 1
+                with open(LOG_FILE, 'a') as lf:
+                    lf.write(json.dumps({'repo': repo, 'pr': pr_num, 'status': 'skip'}) + '\n')
+            else:
+                content_bytes = diff_text.encode('utf-8', errors='replace')
+                pending_hf[hf_path] = content_bytes
+                results['downloaded'] += 1
+
+                local_path = OUT_DIR / repo / f'{pr_num}.diff'
+                local_path.parent.mkdir(parents=True, exist_ok=True)
+                local_path.write_bytes(content_bytes)
+
+                if len(pending_hf) >= BATCH_UPLOAD:
+                    flush_pending()
+
+        queue.task_done()
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -148,72 +159,75 @@ def main():
     if MAX_PRS:
         print(f'TEST MODE: max {MAX_PRS} PRs por repo', flush=True)
 
-    print(f'Job {job_idx}: {len(job)} repos, {total_prs} PRs asignados', flush=True)
+    print(f'Job {job_idx}: {len(job)} repos, {total_prs} PRs | {N_THREADS} threads', flush=True)
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    downloaded = 0
-    failed     = 0
-    skipped    = 0
-    token_idx  = 0
-    pending_upload = {}
+    # Llenar la queue con todos los (repo, pr_num)
+    queue = Queue()
     repo_names = []
-
     for item in job:
         repo = item['repo']
         prs  = item['prs'][:MAX_PRS] if MAX_PRS else item['prs']
         repo_names.append(repo)
+        for pr_num in prs:
+            queue.put((repo, pr_num))
 
-        print(f'\n── {repo} ({len(prs)} PRs) ──', flush=True)
+    total_queued = queue.qsize()
+    print(f'PRs en queue: {total_queued}', flush=True)
 
-        for i, pr_num in enumerate(prs):
-            hf_path = f'pr_diffs/{repo}/{pr_num}.diff'
+    start = time.time()
 
-            diff_text = download_diff(repo, pr_num, token_idx)
-            token_idx += 1
+    # Lanzar un thread por token
+    threads = [Thread(target=worker, args=(i, queue), daemon=True) for i in range(N_THREADS)]
+    for t in threads:
+        t.start()
 
-            if diff_text is None:
-                skipped += 1
-                with open(LOG_FILE, 'a') as lf:
-                    lf.write(json.dumps({'repo': repo, 'pr': pr_num, 'status': 'skip'}) + '\n')
-            else:
-                content_bytes = diff_text.encode('utf-8', errors='replace')
-                pending_upload[hf_path] = content_bytes
-                downloaded += 1
+    # Reportar progreso cada 30s desde el main thread
+    last_report = start
+    while any(t.is_alive() for t in threads):
+        time.sleep(5)
+        now = time.time()
+        if now - last_report >= 30:
+            with lock:
+                dl = results['downloaded']
+                sk = results['skipped']
+            elapsed = now - start
+            rate = (dl + sk) / elapsed * 60 if elapsed > 0 else 0
+            remaining = total_queued - dl - sk
+            print(f'  progreso: {dl+sk}/{total_queued} ({rate:.0f}/min) | dl={dl} skip={sk} | ~{remaining/rate:.0f}min restantes' if rate > 0 else f'  progreso: {dl+sk}/{total_queued}', flush=True)
+            last_report = now
 
-                local_path = OUT_DIR / repo / f'{pr_num}.diff'
-                local_path.parent.mkdir(parents=True, exist_ok=True)
-                local_path.write_bytes(content_bytes)
+    for t in threads:
+        t.join()
 
-            if len(pending_upload) >= BATCH_UPLOAD:
-                ok = hf_upload_files(pending_upload)
-                if ok:
-                    print(f'  subidos {len(pending_upload)} archivos a HF', flush=True)
-                else:
-                    failed += len(pending_upload)
-                    print(f'  FALLO upload {len(pending_upload)} archivos', flush=True)
-                pending_upload = {}
+    # Subir lo que quedó pendiente
+    with lock:
+        flush_pending()
 
-            if (i + 1) % 500 == 0:
-                pct = (i + 1) / len(prs) * 100
-                print(f'  {repo}: {i+1}/{len(prs)} ({pct:.0f}%) dl={downloaded} skip={skipped}', flush=True)
+    elapsed = time.time() - start
+    rate = (results['downloaded'] + results['skipped']) / elapsed * 60
 
-            time.sleep(SLEEP_BETWEEN)
+    print(f'\n=== Job {job_idx} terminado en {elapsed/60:.1f} min ===', flush=True)
+    print(f'  velocidad: {rate:.0f} PRs/min', flush=True)
+    print(f'  descargados+subidos: {results["downloaded"]}', flush=True)
+    print(f'  skipped (404/406):   {results["skipped"]}', flush=True)
+    print(f'  failed upload:       {results["failed"]}', flush=True)
 
-    if pending_upload:
-        ok = hf_upload_files(pending_upload)
-        if ok:
-            print(f'  subidos {len(pending_upload)} archivos a HF (lote final)', flush=True)
-        else:
-            failed += len(pending_upload)
-            print(f'  FALLO upload lote final {len(pending_upload)} archivos', flush=True)
-
-    print(f'\n=== Job {job_idx} terminado ===', flush=True)
-    print(f'  descargados+subidos: {downloaded}', flush=True)
-    print(f'  skipped (404/406):   {skipped}', flush=True)
-    print(f'  failed upload:       {failed}', flush=True)
-
-    write_summary(job_idx, downloaded, skipped, failed, total_prs, repo_names)
+    lines = [
+        f'## Job {job_idx} — resumen\n',
+        f'| | |',
+        f'|---|---|',
+        f'| PRs asignados | {total_prs} |',
+        f'| Velocidad | {rate:.0f} PRs/min |',
+        f'| Descargados y subidos a HF | {results["downloaded"]} |',
+        f'| No disponibles (404/406) | {results["skipped"]} |',
+        f'| Fallos de upload | {results["failed"]} |',
+        f'| Repos | {", ".join(repo_names)} |',
+    ]
+    if MAX_PRS:
+        lines.insert(1, f'> **TEST MODE**: limitado a {MAX_PRS} PRs por repo\n')
+    SUMMARY_FILE.write_text('\n'.join(lines), encoding='utf-8')
 
 if __name__ == '__main__':
     main()
