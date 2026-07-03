@@ -47,7 +47,7 @@ def gh_headers(token_idx):
     tok = GH_TOKENS[token_idx % len(GH_TOKENS)]
     return {
         'Authorization': f'Bearer {tok}',
-        'Accept': 'application/vnd.github.v3.diff',
+        'Accept': 'application/vnd.github.diff',
         'User-Agent': 'pr-diff-downloader/1.0',
     }
 
@@ -58,7 +58,8 @@ def download_diff(owner_repo, pr_num, token_idx):
             r = requests.get(url, headers=gh_headers(token_idx), timeout=30)
             if r.status_code == 200:
                 return r.text
-            if r.status_code == 404:
+            if r.status_code in (404, 406, 410):
+                # 404: PR no existe, 406: diff no disponible, 410: eliminada
                 return None
             if r.status_code in (429, 403):
                 wait = int(r.headers.get('Retry-After', 60))
@@ -72,13 +73,40 @@ def download_diff(owner_repo, pr_num, token_idx):
             time.sleep(5 * (attempt + 1))
     return None
 
+def hf_upload_batch(files_dict):
+    """Sube archivos via HuggingFace Hub commit API."""
+    url = f'{HF_API}/api/datasets/{HF_DATASET}/commit/main'
+    headers = {'Authorization': f'Bearer {HF_TOKEN}'}
+
+    # Primero hacer pre-upload de los blobs
+    operations = []
+    for hf_path, content_bytes in files_dict.items():
+        # Upload blob
+        blob_url = f'{HF_API}/api/datasets/{HF_DATASET}/upload/main'
+        for attempt in range(MAX_RETRIES):
+            try:
+                r = requests.post(blob_url, headers=headers,
+                                  files=[('file', (hf_path, content_bytes, 'text/plain'))],
+                                  timeout=120)
+                if r.status_code in (200, 201):
+                    break
+                print(f'  blob upload {r.status_code}: {r.text[:100]}', flush=True)
+                time.sleep(5)
+            except Exception as e:
+                print(f'  blob error ({attempt+1}): {e}', flush=True)
+                time.sleep(10)
+        else:
+            return False
+    return True
+
 def hf_upload_files(files_dict):
+    """Sube lote de archivos usando la API de upload de HuggingFace."""
     url = f'{HF_API}/api/datasets/{HF_DATASET}/upload/main'
     headers = {'Authorization': f'Bearer {HF_TOKEN}'}
     multipart = [('file', (path, content, 'text/plain')) for path, content in files_dict.items()]
     for attempt in range(MAX_RETRIES):
         try:
-            r = requests.post(url, headers=headers, files=multipart, timeout=120)
+            r = requests.post(url, headers=headers, files=multipart, timeout=300)
             if r.status_code in (200, 201):
                 return True
             print(f'  HF upload HTTP {r.status_code}: {r.text[:200]}', flush=True)
@@ -95,7 +123,7 @@ def write_summary(job_idx, downloaded, skipped, failed, total_prs, repos):
         f'|---|---|',
         f'| PRs asignados | {total_prs} |',
         f'| Descargados y subidos a HF | {downloaded} |',
-        f'| No disponibles (404) | {skipped} |',
+        f'| No disponibles (404/406) | {skipped} |',
         f'| Fallos de upload | {failed} |',
         f'| Repos | {", ".join(repos)} |',
     ]
@@ -182,7 +210,7 @@ def main():
 
     print(f'\n=== Job {job_idx} terminado ===', flush=True)
     print(f'  descargados+subidos: {downloaded}', flush=True)
-    print(f'  skipped (404):       {skipped}', flush=True)
+    print(f'  skipped (404/406):   {skipped}', flush=True)
     print(f'  failed upload:       {failed}', flush=True)
 
     write_summary(job_idx, downloaded, skipped, failed, total_prs, repo_names)
